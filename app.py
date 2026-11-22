@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# v4 (2026-11-22, 基于 eooce/Auto-Renew-Bothosting 上游原版 + 之前 v1-v3 的修复):
+# - 中文日期/按钮/冷却倒计时识别 (上游原版没有, 中文账单页会读不到日期)
+# - 弹窗按钮按"续期 4 天"优先选, 不盲点第一个 .btn-primary
+# - 真实点击优先, JS 点击兜底; 点完弹窗还在就再点一次
+# - 点完轮询 90 秒, 按"今天+4天"目标日期判断, 识别失败提示
+# - 刷新后没变再等 60 秒复查一次, 两次都没变才报可能未成功
 
 import os, re, sys, time, random, requests, subprocess,ctypes
+from datetime import datetime, timedelta, timezone
 from seleniumbase import SB
 
 # 环境变量配置(可以直接私库在双引号里填写)
@@ -302,6 +309,19 @@ def format_countdown(countdown_str: str) -> str:
 
 # 归一化日期为 YYYY/MM/DD
 def normalize_date(date_str: str) -> str:
+    # 中文: 2026年11月18日 -> 2026/11/18
+    m = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", date_str)
+    if m:
+        return f"{m.group(1)}/{int(m.group(2)):02d}/{int(m.group(3)):02d}"
+    # 英文月份名: 18 Nov 2026 / Nov 18, 2026 -> 2026/11/18
+    months = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+              "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+    m = re.search(r"(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})", date_str)
+    if m and m.group(2).lower()[:3] in months:
+        return f"{m.group(3)}/{months[m.group(2).lower()[:3]]:02d}/{int(m.group(1)):02d}"
+    m = re.search(r"([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})", date_str)
+    if m and m.group(1).lower()[:3] in months:
+        return f"{m.group(3)}/{months[m.group(1).lower()[:3]]:02d}/{int(m.group(2)):02d}"
     parts = date_str.split('/')
     if len(parts) == 3:
         if len(parts[2]) == 4:   # MM/DD/YYYY
@@ -313,10 +333,11 @@ def normalize_date(date_str: str) -> str:
 DATE_RE = r"(\d{4}/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}/\d{4})"
 
 # 获取过期日期
-DATE_RE = r"(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{1,2}/\d{1,2}/\d{4}|\d{4}-\d{2}-\d{2})"
+DATE_RE = r"(\d{4}年\d{1,2}月\d{1,2}日|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}|\d{1,2}/\d{1,2}/\d{4}|\d{4}-\d{2}-\d{2})"
 def extract_expiry_date(page_source: str) -> str:
     patterns = [
         r"[Ee]xpires\s*[:\-]?\s*" + DATE_RE,   # 优先匹配包含 "Expires" 的
+        r"(\d{4}年\d{1,2}月\d{1,2}日)\s*到期",  # 中文: 2026年11月18日 到期
         DATE_RE,                                # 兜底匹配
     ]
     
@@ -435,8 +456,10 @@ def main():
         outer_renew_selector = None
         countdown_text = None
         possible_selectors = [
+            'button:contains("续期免费套餐")',
             'type:button("Renew free plan")',
             'button:contains("Renew free plan")',
+            'button:contains("续期")',
             '[class*="btn btn-primary btn-sm"]',
         ]
 
@@ -444,13 +467,13 @@ def main():
             try:
                 if sb.is_element_visible(selector):
                     button_text = sb.get_text(selector)
-                    # "Renew in HH:MM:SS" / "Renewal cooldown HH:MM:SS" 都表示冷却中, 时间为距可续期的剩余时长
-                    match = re.search(r"(?:Renew in|Renewal cooldown)\s+(\d{1,2}:\d{2}:\d{2})", button_text, re.I)
+                    # "Renew in HH:MM:SS" / "Renewal cooldown HH:MM:SS" / 中文冷却 / "HH:MM:SS 后可续期" 都表示冷却中, 时间为距可续期的剩余时长
+                    match = re.search(r"(?:Renew in|Renewal cooldown|续期冷却|冷却)\s*[:：]?\s*(\d{1,2}:\d{2}:\d{2})", button_text, re.I) or re.search(r"(\d{1,2}:\d{2}:\d{2})\s*后可续期", button_text)
                     if match:
                         countdown_text = match.group(1)
                         print(f"⏳ 续期冷却中, 未到续期时间: '{button_text}'")
                         break
-                    elif "Renew" in button_text:
+                    elif "Renew" in button_text or "续期" in button_text:
                         outer_renew_selector = selector
                         print(f"✅ 续期按钮可用: '{button_text}'")
                         break
@@ -490,24 +513,134 @@ def main():
                 send_telegram_message(format_notification("❌ 续期失败", error="Turnstile 验证未通过"))
                 return
 
-            # 点击续期按钮
+            # 点击续期按钮: 先列出弹窗里所有按钮, 优先点含 "续期 4 天 / Renew for 4 days" 的那个,
+            # 而不是盲点第一个 .btn-primary (可能是取消/关闭, 也可能当时还是禁用状态)
             print("⏳ 等待续期按钮可用并点击...")
-            time.sleep(5) 
+            time.sleep(5)
 
             modal_button_clicked = False
             try:
-                selector = 'div[role="dialog"] button.btn-primary' 
-                sb.click(selector, timeout=8)
-                modal_button_clicked = True
+                dialog_buttons = sb.execute_script(
+                    "return Array.from(document.querySelectorAll('div[role=\"dialog\"] button')).map(b => "
+                    "({text: (b.innerText || '').trim(), disabled: !!b.disabled, cls: b.className}));"
+                ) or []
+                print(f"🔍 弹窗按钮: {dialog_buttons}")
+                # 优先: 文案含续期+4天, 其次: 文案含续期/Renew, 最后: 第一个 .btn-primary
+                target_idx = None
+                for i, b in enumerate(dialog_buttons):
+                    t = b.get("text", "") if isinstance(b, dict) else ""
+                    if ("续期" in t or "Renew" in t) and ("4" in t or "天" in t or "day" in t.lower()):
+                        target_idx = i
+                        break
+                if target_idx is None:
+                    for i, b in enumerate(dialog_buttons):
+                        t = b.get("text", "") if isinstance(b, dict) else ""
+                        if "续期" in t or "Renew" in t:
+                            target_idx = i
+                            break
+                if target_idx is not None:
+                    _t = dialog_buttons[target_idx].get('text')
+                    print(f"🖱️ 点击弹窗按钮: '{_t}'")
+                    # 先用真实点击 (Selenium 点击, 会触发 Svelte/React 的事件),
+                    # JS 的 btn.click() 有时只触发 DOM 事件, 按钮绑定的提交逻辑没跑起来,
+                    # 这就是上次"点了但到期没变"最可能的原因; 真实点击失败才回落到 JS 点击
+                    _real_clicked = False
+                    try:
+                        sb.click(f'div[role="dialog"] button:contains("{_t}")', timeout=8)
+                        _real_clicked = True
+                    except Exception as e:
+                        print(f"⚠️ 真实点击失败, 改用 JS 点击: {e}")
+                    if not _real_clicked:
+                        sb.execute_script(
+                            "var btns = document.querySelectorAll('div[role=\"dialog\"] button');"
+                            f"btns[{target_idx}].click();"
+                        )
+                    modal_button_clicked = True
+                else:
+                    selector = 'div[role="dialog"] button.btn-primary'
+                    sb.click(selector, timeout=8)
+                    modal_button_clicked = True
                 print("✅ 已点击续期按钮")
+                # 点完立刻把弹窗里的文字打出来: 成功/失败提示都在这里,
+                # 下次日志里能直接看到是"已续期"还是"续期失败/请重试", 不用再靠猜
+                try:
+                    sb.sleep(2)
+                    _dlg = sb.get_text('div[role="dialog"]')
+                    print(f"🔍 点后弹窗文本: {(_dlg or '').strip()[:500]}")
+                except Exception as e:
+                    print(f"🔍 点后弹窗已关闭或读不到文本: {e}")
+                    _dlg = ""
+                # v4: 点完弹窗还在、按钮还在、又没出现成功提示, 说明第一次点击没提交成功, 再点一次
+                # (上次就是点了但到期没变, 很可能就是这一步丢了)
+                try:
+                    if _dlg and ("续期 4 天" in _dlg or "Renew for 4 days" in _dlg) and "续期成功" not in _dlg and "已续期" not in _dlg:
+                        print("⚠️ 点后弹窗还在, 按钮没消失, 再点一次 '续期 4 天'")
+                        sb.sleep(3)
+                        sb.click(f'div[role="dialog"] button:contains("续期 4 天")', timeout=8)
+                        print("✅ 已第二次点击续期按钮")
+                        sb.sleep(2)
+                except Exception as e:
+                    print(f"⚠️ 第二次点击失败/弹窗已关闭: {e}")
             except Exception as e:
                 print(f"续期按钮点击失败: {e}")
 
-            sb.sleep(5)
-            sb.refresh()
+            # 点完先别立刻刷新: 轮询 90 秒等日期变化 / 成功提示, 刷新会打断还没完成的续期请求
+            # 上次只等了 30 秒就刷新, 后台可能还没处理完; 另外弹窗文案里同时有
+            # "当前到期 11月20日"和"续到 11月22日", 直接取第一个日期会误判为没变,
+            # 所以这里也按"今天+4天"那个目标日期来判断
+            try:
+                _today = datetime.now(timezone(timedelta(hours=8))).date()
+                _expected = (_today + timedelta(days=4)).strftime("%Y/%m/%d")
+            except Exception:
+                _expected = ""
+            if _expected:
+                print(f"📅 预期新到期日期 (今天+4天): {_expected}")
+            print("⏳ 等待续期生效 (最多 90 秒, 不立即刷新)...")
+            renewed_without_refresh = False
+            for _ in range(18):
+                sb.sleep(5)
+                try:
+                    check_text = sb.get_page_text()
+                except Exception:
+                    check_text = ""
+                if any(k in check_text for k in ["续期成功", "已续期", "Renewed", "successfully renewed", "Success"]):
+                    print(f"✅ 页面出现成功提示")
+                    renewed_without_refresh = True
+                    break
+                if any(k in check_text for k in ["续期失败", "验证失败", "请重试", "Something went wrong", "failed to renew"]):
+                    print(f"❌ 页面出现失败提示, 弹窗/页面文本前 500 字: {(check_text or '')[:500]}")
+                    break
+                if _expected and _expected in check_text:
+                    print(f"📅 未刷新就检测到目标到期日期: {_expected}")
+                    renewed_without_refresh = True
+                    break
+                try:
+                    _ex = get_expiry_from_dom(sb)
+                except Exception:
+                    _ex = None
+                if _ex and _ex != current_expiry:
+                    print(f"📅 未刷新就检测到新到期日期: {_ex}")
+                    renewed_without_refresh = True
+                    break
+            try:
+                sb.save_screenshot("after_renew.png")
+                with open("after_renew.html", "w", encoding="utf-8") as f:
+                    f.write(sb.get_page_source())
+                print("💾 已保存 after_renew.png / after_renew.html, 可用来看弹窗到底点了什么")
+            except Exception as e:
+                print(f"⚠️ 保存续期后快照失败: {e}")
+
+            if not renewed_without_refresh:
+                sb.sleep(3)
+                sb.refresh()
             print("⏳ 等待新的过期时间...")
             sb.wait_for_ready_state_complete()
-            sb.sleep(3)
+            sb.sleep(15)
+            try:
+                _dom_txt = sb.get_text('span.st-meta') if sb.is_element_present('span.st-meta') else ""
+                print(f"🔍 刷新后账单页到期文本: {(_dom_txt or '').strip()}")
+            except Exception as e:
+                print(f"🔍 刷新后读到期文本失败: {e}")
 
             # 提取新的到期日期和倒计时
             try:
@@ -515,7 +648,7 @@ def main():
             except Exception:
                 new_page_text = sb.get_page_source()
             new_expiry = get_expiry_from_dom(sb) or extract_expiry_date(new_page_text)
-            new_match = re.search(r"(?:Renewal cooldown|Renew in)\s+(\d{1,2}:\d{2}:\d{2})", new_page_text)
+            new_match = re.search(r"(?:Renewal cooldown|Renew in|续期冷却|冷却)\s*[:：]?\s*(\d{1,2}:\d{2}:\d{2})", new_page_text)
             if new_match:
                 new_countdown = new_match.group(1)
                 print(f"✅ 续期成功！新的倒计时: {new_countdown}")
@@ -539,14 +672,36 @@ def main():
                         )
                     )
                 else:
-                    print("⚠️ 续期结果未知，到期日期未变化，请手动检查")
-                    send_telegram_message(
-                        format_notification(
-                            "⚠️ 续期可能未成功",
-                            extra="请登录后台检查",
-                            expiry_date=current_expiry or "（未获取到）"
+                    # v4: 第一次刷新后没变, 别急着判失败, 后台可能还在处理:
+                    # 再等 60 秒、再刷新一次, 只有两次都没变才报"可能未成功"
+                    print("⏳ 刷新后到期未变, 再等 60 秒复查一次 (后台可能还在处理)...")
+                    sb.sleep(60)
+                    sb.refresh()
+                    sb.wait_for_ready_state_complete()
+                    sb.sleep(10)
+                    try:
+                        _txt2 = sb.get_page_text() + "\n" + sb.get_page_source()
+                    except Exception:
+                        _txt2 = sb.get_page_source()
+                    _ex2 = get_expiry_from_dom(sb) or extract_expiry_date(_txt2)
+                    if _ex2 and _ex2 != current_expiry:
+                        print(f"✅ 复查续期成功, 到期日期已更新为: {_ex2}")
+                        send_telegram_message(
+                            format_notification(
+                                "✅ 续期成功",
+                                extra="到期日期已更新 (复查确认)",
+                                expiry_date=_ex2
+                            )
                         )
-                    )
+                    else:
+                        print("⚠️ 续期结果未知, 两次复查到期日期都未变化, 请手动检查")
+                        send_telegram_message(
+                            format_notification(
+                                "⚠️ 续期可能未成功",
+                                extra="请登录后台检查",
+                                expiry_date=current_expiry or "（未获取到）"
+                            )
+                        )
 
         else:
             if countdown_text:
