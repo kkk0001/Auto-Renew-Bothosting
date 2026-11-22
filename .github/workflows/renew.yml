@@ -2,7 +2,7 @@ name: Auto Renew Bot-hosting
 
 on:
   schedule:
-    - cron: '30 22 * * *' # 每天UTC 1点 (北京时间9点, 一般都会推迟),自行根据服务到期时间调整
+    - cron: '30 22 * * *' # UTC 22:30 = 北京时间次日 06:30, 每天跑
   workflow_dispatch:
 
 jobs:
@@ -42,6 +42,15 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
           xvfb-run --auto-servernum python3 app.py
+
+      - name: 📸 上传续期截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: after-renew
+          path: |
+            after_renew.png
+            after_renew.html
 
       - name: 🧽 清理进程和临时文件
         if: always()
